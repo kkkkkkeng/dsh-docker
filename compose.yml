@@ -1,0 +1,27 @@
+services:
+  dsh:
+    image: ghcr.io/kkkkkkeng/dsh-docker:latest
+    container_name: dsh
+    restart: unless-stopped
+
+    environment:
+      TZ: Asia/Shanghai
+      TRUSTED_HOST: ${TRUSTED_HOST:-}
+
+    ports:
+      - "127.0.0.1:3080:3080"
+
+    volumes:
+      - dsh_data:/root
+      - ${DSH_WORKSPACE:-}:/workspace
+
+    working_dir: /workspace
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    mem_limit: 1536m
+    cpus: 1.5
+
+volumes:
+  dsh_data:

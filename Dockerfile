@@ -40,4 +40,6 @@ WORKDIR /workspace
 
 EXPOSE 3080
 
-CMD ["dsh", "web", "--patch", "/etc/dsh/network.yml", "--no-open"]
+# Expand the optional runtime authority without word splitting or shell evaluation.
+# exec keeps DSH as PID 1 so docker stop delivers signals directly.
+CMD ["sh", "-ec", "if [ -n \"${TRUSTED_HOST:-}\" ]; then set -- --trusted-host \"$TRUSTED_HOST\"; else set --; fi; exec dsh web --patch /etc/dsh/network.yml --no-open \"$@\""]
