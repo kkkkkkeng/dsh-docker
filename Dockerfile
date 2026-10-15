@@ -17,7 +17,8 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g --no-audit --no-fund \
-      "@deepseek-ai/dsh@${DSH_VERSION}" \
+      "@deepseek-ai/dsh@${DSH_VERSION}" pnpm@10 \
+    && pnpm --version \
     && npm cache clean --force
 
 LABEL org.opencontainers.image.title="DSH development environment" \
