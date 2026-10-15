@@ -1,0 +1,261 @@
+name: Build and publish DSH
+
+on:
+  schedule:
+    # Every day at 03:20 UTC / 11:20 Asia/Shanghai.
+    - cron: '20 3 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
+
+# Publish to ghcr.io/<owner>/<repository>, using GITHUB_TOKEN only.
+permissions:
+  contents: read
+
+concurrency:
+  group: dsh-image-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      published: ${{ steps.publish.outcome == 'success' }}
+      image: ${{ steps.version.outputs.image }}
+      digest: ${{ steps.publish.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve npm latest
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(npm view @deepseek-ai/dsh dist-tags.latest --registry=https://registry.npmjs.org/)
+          # npm versions must also be safe Docker tags and shell values.
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "Resolved npm latest: $version" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether latest is already published
+        id: check
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rebuild=true
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            # A missing/inaccessible tag triggers a build, never a false skip.
+            if docker buildx imagetools inspect "$IMAGE:$VERSION" --raw > /tmp/version.json && \
+               docker buildx imagetools inspect "$IMAGE:latest" --raw > /tmp/latest.json; then
+              if cmp -s /tmp/version.json /tmp/latest.json; then
+                rebuild=false
+              fi
+            fi
+          fi
+          echo "rebuild=$rebuild" >> "$GITHUB_OUTPUT"
+          echo "Build required: $rebuild" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build candidate for native runtime testing
+        if: steps.check.outputs.rebuild == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: dsh-candidate:test
+          build-args: DSH_VERSION=${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Publish the loaded image itself after testing, without a second build.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Smoke test candidate before publishing
+        if: steps.check.outputs.rebuild == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker logs dsh-smoke || true
+            docker rm -f dsh-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          actual=$(docker run --rm --entrypoint node dsh-candidate:test \
+            -p "require('/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json').version")
+          test "$actual" = "$VERSION"
+          docker run --rm --entrypoint sh dsh-candidate:test -ec '
+            for tool in python3 pip3 cc cmake ninja git curl wget jq ssh rg vim tmux ip ping dig ps; do
+              command -v "$tool" >/dev/null
+            done
+            test -f /usr/share/zoneinfo/Asia/Shanghai
+            python3 -m venv /tmp/test-venv
+          '
+          docker run --rm --entrypoint node dsh-candidate:test -e '
+            const {createRequire} = require("node:module");
+            const r = createRequire("/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json");
+            const pty = r("node-pty");
+            const p = pty.spawn("/bin/sh", ["-c", "printf PTY_OK"], {
+              name: "xterm", cols: 80, rows: 24, cwd: "/workspace", env: process.env
+            });
+            let output = "";
+            p.onData(data => output += data);
+            p.onExit(event => {
+              console.log(output);
+              process.exit(event.exitCode === 0 && output.includes("PTY_OK") ? 0 : 1);
+            });
+          '
+          docker run -d --init --name dsh-smoke \
+            -p 127.0.0.1:3080:3080 dsh-candidate:test
+          python3 - <<'PY'
+          import http.cookiejar
+          import re
+          import subprocess
+          import time
+          import urllib.request
+          from html.parser import HTMLParser
+          from urllib.parse import urljoin, urlsplit
+
+          token = None
+          for _ in range(120):
+              logs = subprocess.check_output(['docker', 'logs', 'dsh-smoke'], text=True, stderr=subprocess.STDOUT)
+              match = re.search(r'[?&]token=([A-Za-z0-9_-]+)', logs)
+              if match:
+                  token = match[1]
+                  break
+              time.sleep(1)
+          assert token, 'No launch token found in startup logs'
+          jar = http.cookiejar.CookieJar()
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar))
+          with opener.open('http://localhost:3080/?token=' + token, timeout=15) as response:
+              assert response.status == 200
+              html = response.read().decode()
+          assert '__DSH_BOOT__' in html, 'Missing DSH boot manifest'
+          class Scripts(HTMLParser):
+              sources = []
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  if tag == 'script' and attrs.get('src'):
+                      self.sources.append(attrs['src'])
+          parser = Scripts()
+          parser.feed(html)
+          assert parser.sources, 'Missing frontend scripts'
+          for src in parser.sources:
+              url = urljoin('http://localhost:3080/', src)
+              assert urlsplit(url).netloc == 'localhost:3080', src
+              with opener.open(url, timeout=10) as response:
+                  assert response.status == 200
+                  assert 'javascript' in response.headers.get('Content-Type', '').lower()
+                  assert response.read(), 'Empty frontend script'
+          PY
+          test "$(docker inspect --format '{{.State.Running}}' dsh-smoke)" = true
+          docker stop --time 20 dsh-smoke
+          exit_code=$(docker inspect --format '{{.State.ExitCode}}' dsh-smoke)
+          # 143 is a normal SIGTERM exit; 137 means forced SIGKILL.
+          [[ "$exit_code" == 0 || "$exit_code" == 143 ]]
+          echo 'Candidate passed version, tools, Web HTML/assets and stop tests.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish exact tested image
+        id: publish
+        if: steps.check.outputs.rebuild == 'true'
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag dsh-candidate:test "$IMAGE:$VERSION"
+          docker tag dsh-candidate:test "$IMAGE:latest"
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+          ref=$(docker image inspect "$IMAGE:$VERSION" --format '{{index .RepoDigests 0}}')
+          digest="${ref##*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  verify-published:
+    # Fresh runner: verify the actual registry image, not the local build cache.
+    needs: build
+    if: needs.build.outputs.published == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: read
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and run published image by immutable digest
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$IMAGE@$DIGEST"
+          docker pull "$ref"
+          actual=$(docker run --rm --entrypoint node "$ref" \
+            -p "require('/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json').version")
+          test "$actual" = "$VERSION"
+          cleanup() {
+            docker logs dsh-published || true
+            docker rm -f dsh-published >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d --init --name dsh-published \
+            -p 127.0.0.1:3080:3080 "$ref"
+          python3 - <<'PY'
+          import http.cookiejar
+          import re
+          import subprocess
+          import time
+          import urllib.request
+
+          token = None
+          for _ in range(120):
+              logs = subprocess.check_output(['docker', 'logs', 'dsh-published'], text=True, stderr=subprocess.STDOUT)
+              match = re.search(r'[?&]token=([A-Za-z0-9_-]+)', logs)
+              if match:
+                  token = match[1]
+                  break
+              time.sleep(1)
+          assert token, 'No launch token found in startup logs'
+          opener = urllib.request.build_opener(
+              urllib.request.ProxyHandler({}),
+              urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+          with opener.open('http://localhost:3080/?token=' + token, timeout=15) as response:
+              assert response.status == 200
+              assert '__DSH_BOOT__' in response.read().decode()
+          PY
+          test "$(docker inspect --format '{{.State.Running}}' dsh-published)" = true
+          echo "Published image verified: \`$ref\` (DSH $VERSION, linux/amd64)" >> "$GITHUB_STEP_SUMMARY"
